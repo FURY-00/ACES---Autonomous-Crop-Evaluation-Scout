@@ -1,0 +1,10 @@
+# Raspberry Pi 4 (Bookworm). Install OpenCV and picamera2 from apt, not pip:
+#   sudo apt install python3-opencv python3-picamera2
+numpy>=1.24
+pyserial>=3.5
+pynmea2>=1.19
+flask>=3.0
+requests>=2.31
+tflite-runtime>=2.14        # Pi only. On a laptop use: tensorflow
+gspread>=6.0                # only if SHEETS_ENABLED
+google-auth>=2.28
