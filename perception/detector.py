@@ -1,54 +1,47 @@
 """
-Leaf abnormality detector, v3.
+Leaf abnormality detector, v4 -- hue-based.
 
-Three problems from real leaves drove this rewrite:
+WHY HUE, AFTER ALL THAT
+-----------------------
+v3 decided abnormality from d = (G-R)/(R+G+B), chosen because it is
+invariant to uniform illumination change. Sound reasoning -- but measured on
+real leaves from this project it is beaten by plain HSV hue:
 
-  (a) healthy tissue was being called abnormal
-  (b) the abnormal region changed every time the leaf angle changed
-  (c) thresholds tuned on one shot failed on the next
+    index    healthy   chlorotic   necrotic    worst-case separation
+    hue        40.8       32.0       17.2        2.01   clean
+    d          +0.08      +0.02      -0.11       1.75   usable
+    b*        162.8      178.5      154.1        0.73   overlapping
+    a*        107.5      111.3      134.9        0.70   overlapping
+    ExG        97.4      111.4        9.5        0.56   overlapping
 
-All three have one root cause: HSV hue and saturation are NOT invariant to
-illumination. Tilt a glossy leaf and the light reaching the sensor changes
-by a factor of two or more across the surface. Hue wobbles, saturation
-collapses on the bright side, and any fixed threshold slides around
-underneath you. You were not mis-tuning. You were tuning a moving target.
+The pixel distributions barely touch:
 
-The fix has three parts.
+    healthy      p5 37   p50 40   p95 48
+    chlorotic    p5 27   p50 32   p95 36
+    necrotic     p5 13   p50 17   p95 21
 
-1. AN ILLUMINATION-INVARIANT INDEX
+Chlorotic tops out at 36 and healthy starts at 37, so ONE threshold near 36
+separates healthy from both yellowing and browning. That is the whole rule.
 
-       d = (G - R) / (R + G + B)
+THE OLD HUE BUG IS NOT BACK
+---------------------------
+The week-5 detector also used hue and failed, because it used hue TWICE: once
+to decide "is this plant at all" and again to decide "is this diseased".
+Necrotic tissue failed the first test, so it was discarded as background
+before the second ever ran.
 
-   Scale every channel by the same factor -- exactly what shading, tilt and
-   exposure do to a matte surface -- and d does not change: the factor
-   cancels top and bottom. Hue loses this property once saturation is low,
-   which is precisely where diseased tissue lives.
+Here hue decides only the second question. The leaf is still found without
+hue -- green core plus growth into anything that is not background, plus
+hole filling -- so brown tissue is inside the leaf mask before we judge it.
+That separation of concerns is what makes hue safe to use now.
 
-   d is also monotone in disease progression, which is a happy bonus:
-       healthy green     d ~ +0.10 .. +0.20
-       chlorotic yellow  d ~  0.00 .. +0.06
-       necrotic brown    d ~ -0.06 .. +0.02
-
-2. A REFERENCE TAKEN FROM THE IMAGE ITSELF
-
-   Instead of "is this pixel greener than hue 33", we ask "is this pixel
-   much less green than the healthy tissue ON THIS LEAF, IN THIS SHOT". The
-   reference is the 75th percentile of d inside the leaf. Change the angle,
-   the light or the camera and the reference moves with it.
-
-3. AN ABSOLUTE GATE -- this is what kills the false positives
-
-   A purely relative test ALWAYS finds the least-green part of anything.
-   Show it a perfectly healthy leaf and it will confidently outline the
-   slightly-less-green 5%. That is problem (a), exactly.
-
-   So a pixel must fail BOTH tests: much less green than this leaf's own
-   healthy tissue, AND below an absolute greenness that healthy tissue never
-   reaches. Relative alone gives false positives; absolute alone gives back
-   the old lighting sensitivity. The AND of the two is stable.
-
-Hysteresis on top: strong seeds grow into weakly-abnormal neighbours, so
-lesion edges stop flickering from frame to frame.
+WHAT IS STILL TRUE FROM v3
+--------------------------
+Everything except the decision rule: leaf-first segmentation, adaptive
+specular removal, shadow exclusion, hysteresis, blob filtering, and the
+refusal to judge a frame that is mostly glare. d is still computed and
+reported, because it is a useful sanity check on whether a region is
+vegetation at all.
 """
 
 from dataclasses import dataclass, field
@@ -222,6 +215,23 @@ def segment_leaf(bgr, p):
         leaf = (np.isin(lab, keep_ids).astype(np.uint8) * 255
                 if keep_ids else core)
 
+        # --- 3b. BOUND THE GROWTH ------------------------------------------
+        # Connectivity alone is not enough. A leaf touching a stem touching a
+        # wall touching a roof is all one connected region, so the mask
+        # happily swallowed an entire building and reported "leaf = 69% of
+        # frame". Then the tissue test correctly rejected it, and the leaf we
+        # actually wanted went with it.
+        #
+        # Physical constraint: diseased tissue is ON a leaf, so it is never
+        # far from green tissue. Growth is therefore capped at a fixed
+        # distance from the green core. A brown edge lesion is ~20 px from
+        # something green. A building is not.
+        grow_px = int(p.get("grow_max_px", 40))
+        if grow_px > 0:
+            k = 2 * grow_px + 1
+            reach = cv2.dilate(seed, np.ones((k, k), np.uint8))
+            leaf = cv2.bitwise_and(leaf, reach)
+
     leaf = cv2.morphologyEx(leaf, cv2.MORPH_CLOSE,
                             np.ones((p["close_k"], p["close_k"]), np.uint8))
     if p["fill_holes"]:
@@ -247,7 +257,7 @@ def detect(bgr, p=None):
     res = Result()
     blur = cv2.GaussianBlur(bgr, (5, 5), 0)
     hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
-    _, Sc, Vc = cv2.split(hsv)
+    Hc, Sc, Vc = cv2.split(hsv)
 
     leaf, healthy_seed, core, bg = segment_leaf(blur, p)
     res.leaf_mask = leaf
@@ -282,7 +292,9 @@ def detect(bgr, p=None):
     spec_mask = cv2.morphologyEx(spec_mask, cv2.MORPH_CLOSE,
                                  np.ones((9, 9), np.uint8))
 
-    shadow = cv2.inRange(Vc, 0, p["shadow_v_max"])
+    # Only true black is treated as unjudgeable shadow. The old threshold of
+    # 32 removed dark necrotic tissue along with the shadows.
+    shadow = cv2.inRange(Vc, 0, p.get("shadow_v_max", 18))
     unknown = cv2.bitwise_and(
         cv2.bitwise_or(cv2.bitwise_or(glare, spec_mask), shadow), leaf)
     res.unknown_mask = unknown
@@ -299,85 +311,138 @@ def detect(bgr, p=None):
     res.d_map = d
     dv = d[jm]
     d_ref = float(np.percentile(dv, p.get("ref_percentile", 75)))
+
     upper = dv[dv >= np.median(dv)]              # spread of the HEALTHY side
     spread = max(robust_spread(upper), 0.008)    # so lesions can't inflate it
 
     # ---- 2a. IS THIS EVEN A PLANT? --------------------------------------
-    # d_ref is the greenness of the tissue we are treating as healthy. Real
-    # foliage sits around +0.15 to +0.30. A cable, a wall, a hand or a dark
-    # room gives something near zero or negative.
+    # Leaf tissue -- healthy, yellowing or brown -- lives in hue 8..95.
+    # Skin, sky, concrete and painted surfaces do not. This replaces the old
+    # greenness gate, which rejected a genuinely diseased leaf for the crime
+    # of not being green enough: exactly the bug we were trying to detect.
+    # Hue alone is NOT enough. Measured on this project's own images:
     #
-    # Without this check the relative gate happily finds "the least green
-    # part" of ANY object and reports it as severe disease. Every stage
-    # downstream is conditional on there actually being a leaf here.
-    min_d_ref = p.get("min_d_ref", 0.02)
-    if d_ref < min_d_ref:
+    #     material          hue   saturation
+    #     leaf healthy       41       143
+    #     leaf chlorotic     32       132
+    #     leaf necrotic      17       140
+    #     brick wall         10        32
+    #     concrete floor     13        21
+    #     white wall        123         9
+    #     red container       1       229
+    #
+    # Brick and concrete land in the same hue band as necrotic tissue, which
+    # is why a brick wall was reported as a diseased leaf. SATURATION is what
+    # separates them: every leaf type sits near 130-145 while background
+    # material is far below or far above. Living tissue holds pigment;
+    # masonry does not, and painted plastic overshoots.
+    hue_lo = p.get("hue_min_tissue", 8.0)
+    hue_hi = p.get("hue_max_tissue", 95.0)
+    sat_lo = p.get("sat_min_tissue", 55.0)
+    sat_hi = p.get("sat_max_tissue", 205.0)
+    hue_all = Hc.astype(np.float32)
+    sat_all = Sc.astype(np.float32)
+    tissue = ((hue_all >= hue_lo) & (hue_all <= hue_hi)
+              & (sat_all >= sat_lo) & (sat_all <= sat_hi))
+
+    # PRUNE, do not reject.
+    #
+    # The leaf mask grows outward from green tissue, and in a cluttered scene
+    # that growth follows leaf -> stem -> pole -> roof and swallows the whole
+    # frame. The old code then measured "only 41% of this looks like leaf"
+    # and threw the frame away -- taking the real leaf with it.
+    #
+    # Cutting the non-tissue parts OUT of the mask is strictly better: the
+    # building disappears, the leaf survives, and the ratio afterwards is
+    # computed over actual foliage.
+    tis_u8 = (tissue.astype(np.uint8) * 255)
+    tis_u8 = cv2.morphologyEx(tis_u8, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    tis_u8 = cv2.morphologyEx(tis_u8, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+    leaf = cv2.bitwise_and(leaf, tis_u8)
+
+    # drop anything left that is too small to be a leaf
+    total_px = bgr.shape[0] * bgr.shape[1]
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(leaf, 8)
+    pruned = np.zeros_like(leaf)
+    for i in range(1, n):
+        if stats[i, cv2.CC_STAT_AREA] >= p["min_leaf_frac"] * total_px:
+            pruned[lab == i] = 255
+    leaf = pruned
+    res.leaf_mask = leaf
+    res.leaf_px = int(leaf.sum() / 255)
+
+    if res.leaf_px < 500:
         res.d_ref = d_ref
         res.trusted = False
-        res.note = (f"not vegetation (greenness {d_ref:+.3f} < "
-                    f"{min_d_ref:+.3f}) - nothing plant-like in frame")
+        res.note = "no plant tissue found (nothing with a leaf-like hue and saturation)"
         res.severity = "none"
         return res
 
-    # ---- 2b. THE WHOLE-LEAF CASE ---------------------------------------
-    # The relative test compares tissue against the healthy tissue on the
-    # SAME leaf. A leaf that is yellow edge to edge has no healthy tissue to
-    # compare against, so the relative test finds nothing and the detector
-    # reports a severely diseased leaf as perfectly fine.
-    #
-    # But that leaf is not ambiguous at all -- it is uniformly far below what
-    # living foliage looks like. So when the leaf's own reference is itself
-    # below healthy-foliage greenness, the answer is not "no disease", it is
-    # "all of it".
-    #
-    # The two bounds are doing different jobs:
-    #   below min_d_ref        -> not a plant, reject
-    #   min_d_ref .. d_healthy -> a plant, and the WHOLE leaf is abnormal
-    #   above d_healthy        -> healthy tissue exists, use the normal path
-    d_healthy = p.get("d_healthy_foliage", 0.12)
-    if d_ref < d_healthy:
-        whole = cv2.bitwise_and(judgeable, judgeable)
-        whole = cv2.morphologyEx(whole, cv2.MORPH_OPEN, np.ones((7, 7), np.uint8))
+    # recompute the judgeable region against the pruned mask
+    unknown = cv2.bitwise_and(unknown, leaf)
+    res.unknown_mask = unknown
+    jm = (leaf > 0) & (unknown == 0)
+    if jm.sum() < 400:
         res.d_ref = d_ref
-        res.d_thresh = d_healthy
-        res.abnormal_mask = whole
-        res.abnormal_px = int(whole.sum() / 255)
-        res.ratio = res.abnormal_px / res.leaf_px
-        n, lab, stats, cent = cv2.connectedComponentsWithStats(whole, 8)
-        for i in range(1, n):
-            a = stats[i, cv2.CC_STAT_AREA]
-            if a < p["min_blob_px"]:
-                continue
-            res.blobs.append({
-                "x": int(stats[i, cv2.CC_STAT_LEFT]),
-                "y": int(stats[i, cv2.CC_STAT_TOP]),
-                "w": int(stats[i, cv2.CC_STAT_WIDTH]),
-                "h": int(stats[i, cv2.CC_STAT_HEIGHT]),
-                "area": int(a), "frac": round(a / res.leaf_px, 4),
-                "cx": float(cent[i][0]), "cy": float(cent[i][1]),
-                "mean_d": round(float(d[lab == i].mean()), 4)})
-        res.note = (f"whole leaf is chlorotic/necrotic "
-                    f"(greenness {d_ref:+.3f}, healthy foliage is "
-                    f"{d_healthy:+.3f}+)")
-        for lim, name in SEVERITY_BANDS:
-            if res.ratio < lim:
-                res.severity = name if res.ratio > 0 else "none"
-                break
+        res.trusted = False
+        res.note = "leaf is almost entirely glare or shadow"
         return res
 
-    k_strong = p.get("k_strong", 3.0)
-    k_weak = p.get("k_weak", 1.8)
-    d_abs = p.get("d_abs_max", 0.075)            # the absolute gate
-    d_abs_strong = p.get("d_abs_strong", 0.055)
+    # ---- 2c. THE DECISION: hue ------------------------------------------
+    # Healthy foliage sits above hue_healthy_min. Yellowing drops into the
+    # low 30s, browning into the teens. One threshold catches both.
+    #
+    # A relative term rides on top: a pixel also counts as abnormal if it is
+    # well below the hue of THIS leaf's own healthy tissue. That keeps the
+    # detector working on a naturally pale or naturally dark cultivar without
+    # re-tuning the absolute number.
+    hue = hue_all
+    hue_abs = p.get("hue_healthy_min", 36.0)
+    hue_abs_strong = p.get("hue_strong", 30.0)
+    k_rel = p.get("hue_k_rel", 2.0)
 
-    strong = (d < (d_ref - k_strong * spread)) & (d < d_abs_strong) & jm
-    weak = (d < (d_ref - k_weak * spread)) & (d < d_abs) & jm
+    hv = hue[jm]
+    hue_ref = float(np.percentile(hv, p.get("hue_ref_percentile", 75)))
+    upper = hv[hv >= np.median(hv)]
+    hue_spread = max(robust_spread(upper), 2.0)
+
+    # The relative term is OFF by default, and that is deliberate.
+    #
+    # A reference taken from the leaf itself sounds smart, and it is what v3
+    # did. But on a leaf that is diseased ALL OVER, the reference is itself
+    # low, the threshold slides down with it, and nothing is flagged. That
+    # exact failure produced the "whole leaf" special case in v3 and cost
+    # days of debugging.
+    #
+    # The measured distributions do not need it. Healthy starts at 37,
+    # chlorotic ends at 36: a fixed threshold is cleanly correct and cannot
+    # slide out from under you. Turn it on only if you have a cultivar whose
+    # healthy hue genuinely sits below 37.
+    if p.get("hue_use_relative", False):
+        hue_rel = hue_ref - k_rel * hue_spread
+        # never let it go BELOW the absolute rule, only extend above it
+        thr = float(np.clip(max(hue_abs, hue_rel), hue_abs, hue_abs + 8.0))
+        thr_strong = thr - (hue_abs - hue_abs_strong)
+    else:
+        thr, thr_strong = hue_abs, hue_abs_strong
 
     res.d_ref = d_ref
-    res.d_thresh = float(min(d_ref - k_weak * spread, d_abs))
-    res.debug = {"spread": round(spread, 4),
-                 "spec_ref": round(spec_ref, 1),
-                 "strong_px": int(strong.sum()), "weak_px": int(weak.sum())}
+    res.d_thresh = float(thr)
+    res.debug = {"hue_ref": round(hue_ref, 1),
+                 "hue_spread": round(hue_spread, 2),
+                 "hue_thresh": round(thr, 1),
+                 "d_ref": round(d_ref, 3),
+                 "spread": round(spread, 4),
+                 "spec_ref": round(spec_ref, 1)}
+
+    # Very low hue wraps toward red/brown, which is exactly necrosis, so we
+    # do NOT exclude it. But hue above ~90 is blue/purple -- sky, a shirt,
+    # water -- and is never leaf tissue, so it is not called diseased either.
+    # A pixel is only a candidate lesion if it could be leaf tissue at all.
+    plausible = tissue
+
+    strong = (hue < thr_strong) & plausible & jm
+    weak = (hue < thr) & plausible & jm
 
     # ---- 3. hysteresis: grow strong seeds into weak neighbours ---------
     weak_u8 = (weak * 255).astype(np.uint8)
@@ -397,10 +462,11 @@ def detect(bgr, p=None):
         frac = a / res.leaf_px
         if a < p["min_blob_px"] or frac < p["min_blob_frac_of_leaf"]:
             continue
+        # A single blob covering nearly the whole leaf is normal here: a
+        # fully chlorotic leaf IS one big lesion. Only flag it as suspicious,
+        # do not discard it.
         if frac > p["max_blob_frac_of_leaf"]:
-            res.trusted = False
-            res.note = "one blob covers almost the whole leaf - check segmentation"
-            continue
+            res.note = "lesion covers almost the whole leaf"
         kept[lab == i] = 255
         res.blobs.append({
             "x": int(stats[i, cv2.CC_STAT_LEFT]), "y": int(stats[i, cv2.CC_STAT_TOP]),

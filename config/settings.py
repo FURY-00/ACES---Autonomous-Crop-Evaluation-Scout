@@ -31,7 +31,8 @@ ESP32_PORT            = "/dev/serial0"
 ESP32_BAUD            = 115200
 LINK_TIMEOUT_S        = 0.5
 
-GPS_PORT              = "/dev/ttyAMA1"
+GPS_PORT              = "/dev/serial0"   # verified working on this Pi.
+                                         # ttyAMA1 does not exist here.
 GPS_BAUD              = 9600
 GPS_MIN_SATS          = 5
 GPS_MAX_HDOP          = 2.5
@@ -103,20 +104,50 @@ DETECTOR = {
     #           MARGIN, which hole-filling can never recover.
     #   "green" legacy: green mask + hole fill only. Interior lesions only.
     "leaf_method": "grow",
+    "grow_max_px": 40,         # how far the leaf mask may grow beyond green
+                               # tissue. Diseased tissue sits ON a leaf, so it
+                               # is always close to something green. Without
+                               # this cap the mask follows stem -> pole ->
+                               # roof and swallows the whole scene.
+                               # RAISE if large brown areas are being cut off.
+                               # LOWER if the mask still leaks into background.
     "bg_border_frac": 0.07,    # frame border ring used to learn the background
     "bg_k": 3.0,               # LOWER -> leaf grows more eagerly into the
                                # background. RAISE if the outline leaks out.
     "bg_L_weight": 0.35,       # lightness counts less than colour, so shadow
                                # does not get mistaken for background
 
-    # --- the abnormality decision (v3: illumination-invariant) ---------------
-    # d = (G-R)/(R+G+B). See perception/detector.py for why.
-    # Two greenness bounds, doing different jobs:
-    #   below min_d_ref         -> not a plant at all, reject the frame
-    #   min_d_ref .. d_healthy  -> a plant, but the WHOLE leaf is diseased
-    #   above d_healthy         -> healthy tissue present, normal comparison
-    "min_d_ref": 0.02,         # a cable, a wall or a hand sits near 0.000
-    "d_healthy_foliage": 0.12, # living green foliage is +0.15 to +0.30
+    # --- the abnormality decision (v4: HUE) ---------------------------------
+    # Measured on real leaves from this project:
+    #     healthy      hue p5 37   p50 40   p95 48
+    #     chlorotic    hue p5 27   p50 32   p95 36
+    #     necrotic     hue p5 13   p50 17   p95 21
+    # One threshold near 36 separates healthy from BOTH yellowing and
+    # browning. This is the number that matters most.
+    "hue_healthy_min": 36.0,   # below this hue = abnormal. THE key setting.
+    "hue_strong": 30.0,        # seed for hysteresis, ~6 below the main one
+    "hue_use_relative": False, # OFF: a self-referencing threshold slides down
+                               # on a fully diseased leaf and flags nothing.
+                               # The fixed threshold is cleanly correct here.
+    "hue_k_rel": 2.0,          # only used if hue_use_relative is True
+    "hue_ref_percentile": 75,
+    "hue_max_tissue": 95.0,    # above this is blue/purple: sky, shirt, water
+    "hue_min_tissue": 8.0,     # below this is pure red
+    # Saturation is what stops brick and concrete being read as necrosis.
+    # Leaf tissue of every kind measured 130-145 here; brick 32, concrete 21,
+    # white wall 9, red plastic 229.
+    "sat_min_tissue": 55.0,    # below: masonry, concrete, pale walls
+    "sat_max_tissue": 205.0,   # above: painted plastic, signage
+    "min_tissue_frac": 0.55,   # this much of the region must have a leaf-like
+                               # hue, or it is not a plant at all. Replaces the
+                               # old greenness gate, which rejected genuinely
+                               # diseased leaves for not being green enough.
+
+    # --- kept from v3: d is still computed, as a vegetation sanity check -----
+    # d = (G-R)/(R+G+B). See perception/detector.py.
+    # d is no longer a gate -- it is reported for reference only. A fully
+    # chlorotic leaf now falls out naturally as "every pixel below the hue
+    # threshold", with no special case needed.
     "ref_percentile": 75,      # which percentile of d counts as "healthy here"
     "k_weak": 1.8,             # relative gate, in robust std devs below d_ref
     "k_strong": 3.0,           # seed gate for hysteresis
@@ -155,7 +186,7 @@ if os.path.exists(_tuned):
     except Exception as _e:
         print(f"[settings] could not load {_tuned}: {_e}")
 
-DETECT_RATIO_MIN      = 0.02     # ratio above which we call it a detection
+DETECT_RATIO_MIN      = 0.10     # ratio above which we call it a detection
 SEVERITY_BANDS        = [(0.02, "trace"), (0.08, "mild"),
                          (0.20, "moderate"), (1.01, "severe")]
 

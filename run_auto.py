@@ -56,8 +56,10 @@ from navigation.row_vision import RowFollower
 # --- obstacle (webcam) ---
 OBST_X0, OBST_X1 = 0.34, 0.66   # centre band, fraction of width
 OBST_Y0          = 0.45         # from here down, fraction of height
-OBST_BRIGHT      = 160          # absolute grey level counted as "close object"
-OBST_FRACTION    = 0.35         # this much of the band occupied -> obstacle
+OBST_BRIGHT      = 235          # absolute grey level counted as "close object".
+                                # RAISE on pale floors: polished concrete
+                                # reads ~190 and would look like an obstacle.
+OBST_FRACTION    = 0.45         # this much of the band occupied -> obstacle
 OBST_CONFIRM     = 3            # consecutive frames before believing it
 OBST_CLEAR       = 5            # consecutive clear frames before resuming
 
@@ -76,6 +78,67 @@ ROW_END_CONFIRM  = 15           # consecutive plant-free frames -> row over
 STREAM_PORT      = 8080
 
 
+
+def find_esp32_port(preferred=None):
+    """
+    Find the ESP32 without being told which port it is on.
+
+    The device number changes every time the board is reflashed or the USB
+    connection glitches -- ttyACM0 today, ttyACM1 after the next upload. That
+    keeps showing up as a mysterious "no-link", so stop hardcoding it.
+
+    Strategy: try the port the user asked for, then every ttyACM* and
+    ttyUSB*, and keep the first one that actually sends us a '#T' or '#E'
+    line. Talking is the test, not existing.
+    """
+    import glob
+    import serial
+
+    cands = []
+    if preferred and os.path.exists(preferred):
+        cands.append(preferred)
+    for pat in ("/dev/ttyACM*", "/dev/ttyUSB*"):
+        for dev in sorted(glob.glob(pat)):
+            if dev not in cands:
+                cands.append(dev)
+
+    if not cands:
+        print("[esp32] no serial devices found at all.")
+        print("        check the USB cable carries data, then:  dmesg | tail")
+        return None
+
+    for dev in cands:
+        try:
+            ser = serial.Serial()
+            ser.port = dev
+            ser.baudrate = 115200
+            ser.timeout = 0.3
+            ser.dtr = False          # do NOT reset the ESP32 on open
+            ser.rts = False
+            ser.open()
+            ser.reset_input_buffer()
+            t0 = time.time()
+            while time.time() - t0 < 2.5:
+                ser.write(b"$P\n")
+                line = ser.readline().decode("ascii", "ignore")
+                if line.startswith("#T,") or line.startswith("#E,"):
+                    ser.close()
+                    print(f"[esp32] found on {dev}")
+                    return dev
+            ser.close()
+            print(f"[esp32] {dev} opened but stayed silent")
+        except Exception as e:
+            print(f"[esp32] {dev}: {e}")
+    return None
+
+
+# Modes the ESP32 can report that mean "ready to be driven".
+# The no-RC firmware says IDLE/RUN. The older receiver firmware said
+# AUTO_IDLE/AUTO_RUN once CH5 was high. Accepting only the second set meant
+# the mission waited for ever with the no-RC firmware and never sent $GO.
+DRIVABLE_MODES = ("IDLE", "RUN", "TURN", "AUTO_IDLE", "AUTO_RUN")
+
+
 # ---------------------------------------------------------------- link
 class Link:
     """Talks to the ESP32. Degrades to a no-op if it is not there."""
@@ -90,11 +153,39 @@ class Link:
             return
         try:
             import serial
-            self.ser = serial.Serial(port, baud, timeout=0.2)
-            time.sleep(2.0)          # the ESP32 resets when the port opens
+            # DO NOT let pyserial toggle DTR/RTS on open. On ESP32 boards
+            # those lines are wired to the auto-reset circuit, so simply
+            # opening the port can hold the chip in reset -- or drop it into
+            # the bootloader. The port then opens fine and you get silence,
+            # which looks exactly like a dead board.
+            self.ser = serial.Serial()
+            self.ser.port = port
+            self.ser.baudrate = baud
+            self.ser.timeout = 0.2
+            self.ser.dtr = False
+            self.ser.rts = False
+            self.ser.open()
+            self.ser.reset_input_buffer()
             self.ok = True
             threading.Thread(target=self._rx, daemon=True).start()
-            print(f"[esp32] connected on {port}")
+
+            # Prove the board is actually talking before we trust the link.
+            t0 = time.time()
+            while time.time() - t0 < 4.0:
+                if self.read_mode() != "no-link":
+                    break
+                self.send("$P")
+                time.sleep(0.2)
+            if self.read_mode() == "no-link":
+                print(f"[esp32] port {port} opened but NO TELEMETRY received.")
+                print("        The board is not sending #T lines. Try:")
+                print("          - press the ESP32 reset button now")
+                print("          - check the sketch really is aces_noRC.ino")
+                print("          - a charge-only USB cable powers it but "
+                      "carries no data")
+            else:
+                print(f"[esp32] connected on {port}, "
+                      f"telemetry OK (mode {self.read_mode()})")
         except Exception as e:
             print(f"[esp32] NOT connected ({e}) — cameras only")
 
@@ -470,7 +561,7 @@ def main():
 
             elif state == "WAITING":
                 # start only once the ESP32 reports it is in AUTO (CH5 high)
-                if esp in ("AUTO_IDLE", "AUTO_RUN") or not link.ok:
+                if esp in DRIVABLE_MODES or not link.ok:
                     if not obstacle:
                         state = "RUNNING"
                         print("[nav] starting")

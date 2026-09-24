@@ -51,7 +51,9 @@ import numpy as np
 CFG = {
     # vegetation
     "exg_thresh": 0,          # 0 = Otsu (adapts to light automatically)
-    "veg_min_col": 0.25,      # a column is "crop wall" if this much is green
+    "veg_min_col": 0.12,      # a column is "crop wall" if this much is green.
+                          # LOWER for sparse or low walls: leaves lying
+                          # near the ground fill little of the band.
     "smooth_cols": 9,         # column-profile smoothing window
 
     # bands, as fractions of frame height
@@ -59,19 +61,24 @@ CFG = {
     "band_far":  (0.45, 0.65),
 
     # geometry
-    "min_corridor_px": 40,    # narrower than this is not a real corridor
-    "edge_margin": 4,         # ignore this many columns at each frame edge
+    "min_corridor_px": 30,    # narrower than this is not a real corridor
+    "min_wall_px": 12,        # a run of crop shorter than this is noise,
+                              # not a wall
 
     # control
     # Gains act on error expressed as a FRACTION OF FRAME WIDTH, not pixels.
     # In pixels the same physical offset reads 7 units at 240px wide and 41 at
     # 1280 -- so a gain tuned at one resolution would be 5x too strong at
     # another. Normalising means your tuning survives a resolution change.
-    # An offset of 0.25 (a quarter of the frame) with kp_offset 180 gives a
-    # steer of 45.
-    "kp_offset": 180.0,       # error as fraction of width -> steer units
-    "kp_heading": 300.0,
-    "steer_max": 70,
+    # An offset of 0.25 (a quarter of the frame) with kp_offset 260 gives a
+    # steer of 65.
+    # kp_heading was originally larger than kp_offset, which meant a noisy
+    # heading estimate could cancel a real cross-track error -- the bot sat
+    # 15% off centre reporting a steer of +2. Offset is the reliable signal;
+    # heading is a refinement. Weight them accordingly.
+    "kp_offset": 260.0,       # error as fraction of width -> steer units
+    "kp_heading": 120.0,
+    "steer_max": 90,
     "smooth": 0.45,           # temporal blend, 0..1 (higher = more responsive)
 
     # recovery
@@ -119,10 +126,19 @@ def band_edges(mask, band, cfg):
     """
     Find the inner edges of the crop walls inside one horizontal band.
 
-    Returns (left_edge, right_edge). Either may be None if that wall is not
-    visible. Walking inward from each side, rather than looking for the
-    biggest gap, is what makes single-wall detection work: we never need
-    both walls present to locate one of them.
+    Returns (left_edge, right_edge). Either may be None.
+
+    IMPORTANT: we do NOT require the crop to start at the very edge of the
+    frame. An earlier version walked inward from column 0, which meant a
+    strip of floor -- or an operator's leg -- between the frame edge and the
+    start of the crop made the whole wall invisible. That is fine deep inside
+    a real row, where the crop fills the frame edges, but it fails on a short
+    test track where the camera sees past the ends of the walls.
+
+    Instead: look at each half separately, find every run of crop columns,
+    and take the run NEAREST THE CENTRE that is substantial enough to be a
+    wall. Its inner end is the edge we want. Gaps at the frame edge no longer
+    matter.
     """
     h, w = mask.shape
     y0, y1 = int(band[0] * h), int(band[1] * h)
@@ -131,28 +147,32 @@ def band_edges(mask, band, cfg):
         return None, None
 
     prof = strip.mean(axis=0) / 255.0
-    k = cfg["smooth_cols"]
+    k = max(3, cfg["smooth_cols"])
     prof = np.convolve(prof, np.ones(k) / k, mode="same")
     is_crop = prof >= cfg["veg_min_col"]
 
-    m = cfg["edge_margin"]
-    left_edge = right_edge = None
+    min_run = cfg.get("min_wall_px", 12)
 
-    # walk in from the left: find where the crop wall STOPS
-    if is_crop[m:w // 2].any():
-        i = m
-        while i < w and is_crop[i]:
-            i += 1
-        if i > m:
-            left_edge = float(i)
+    def runs(a, offset=0):
+        out, start = [], None
+        for i, v in enumerate(a):
+            if v and start is None:
+                start = i
+            elif not v and start is not None:
+                if i - start >= min_run:
+                    out.append((start + offset, i - 1 + offset))
+                start = None
+        if start is not None and len(a) - start >= min_run:
+            out.append((start + offset, len(a) - 1 + offset))
+        return out
 
-    # walk in from the right
-    if is_crop[w // 2:w - m].any():
-        j = w - 1 - m
-        while j >= 0 and is_crop[j]:
-            j -= 1
-        if j < w - 1 - m:
-            right_edge = float(j)
+    mid = w // 2
+    left_runs = runs(is_crop[:mid], 0)
+    right_runs = runs(is_crop[mid:], mid)
+
+    # nearest-to-centre run on each side; its INNER end is the wall edge
+    left_edge = float(max(r[1] for r in left_runs)) if left_runs else None
+    right_edge = float(min(r[0] for r in right_runs)) if right_runs else None
 
     return left_edge, right_edge
 

@@ -21,10 +21,18 @@
  *    #T,<ms>,<mode>
  *    #E,<event>
  *
- *  Pins are unchanged from your working RC build:
+ *  RECEIVER: two wiring options, pick one with RX_MODE below.
+ *
+ *    RX_PPM  (one signal wire)   PPM/CH1 port  -> GPIO 16
+ *    RX_PWM  (three signal wires) CH1 -> GPIO 35
+ *                                 CH2 -> GPIO 34
+ *                                 CH6 -> GPIO 39
+ *    Either way the receiver still needs 5V and GND from the buck converter,
+ *    and its ground must be common with the ESP32's.
+ *
+ *  Motor pins, unchanged from your working RC build:
  *    Left  BTS7960  RPWM 32  LPWM 33
  *    Right BTS7960  RPWM 14  LPWM 26
- *    PPM input GPIO 16
  *
  *  Safety: in AUTO, if the Pi goes quiet for 2 seconds the ESP32 stops by
  *  itself. The Pi sends something every 100 ms, so a normal loop never gets
@@ -34,8 +42,20 @@
 
 #include <Arduino.h>
 
+// ---- receiver mode -------------------------------------------------------
+// Set to 1 if all three receiver wires go to the PPM/CH1 port (one signal
+// line carrying every channel). Set to 0 if you have separate signal wires
+// from CH1, CH2 and CH6.
+#define RX_MODE_PPM 0
+
 // ---- pins ----------------------------------------------------------------
-#define PPM_PIN   16
+#define PPM_PIN   16          // used only when RX_MODE_PPM is 1
+
+// individual-channel pins, used when RX_MODE_PPM is 0.
+// GPIO 34/35/39 are input-only on the ESP32, which is exactly what we want.
+#define RX_CH1    35          // steering stick
+#define RX_CH2    34          // throttle stick
+#define RX_CH6    39          // the AUTO switch
 #define L_RPWM    32
 #define L_LPWM    33
 #define R_RPWM    14
@@ -67,14 +87,57 @@ volatile uint8_t  ppmIdx  = 0;
 uint32_t piLast = 0;
 int steerCmd = 0;                      // -100..100, + = turn right
 
+// individual-channel capture: each ISR times the high pulse on its own pin
+volatile uint16_t pwmVal[3]  = {1500, 1500, 1000};
+volatile uint32_t pwmRise[3] = {0, 0, 0};
+volatile uint32_t pwmLast[3] = {0, 0, 0};
+
 // ---- PPM -----------------------------------------------------------------
 void IRAM_ATTR ppmISR() {
   uint32_t now = micros(), dt = now - ppmLast; ppmLast = now;
   if (dt > 3000) { ppmIdx = 0; return; }
   if (ppmIdx < 8) ppm[ppmIdx++] = (uint16_t)dt;
 }
-bool ppmAlive() { return (micros() - ppmLast) < 100000UL; }
-int  ch(int i)  { uint16_t v = ppm[i]; return (v > 800 && v < 2200) ? v : 1500; }
+// ---- individual-channel ISRs --------------------------------------------
+// On the rising edge note the time; on the falling edge the difference IS
+// the pulse width, which is the channel value in microseconds.
+void IRAM_ATTR pwmISR(int i, int pin) {
+  uint32_t now = micros();
+  if (digitalRead(pin)) {
+    pwmRise[i] = now;
+  } else if (pwmRise[i]) {
+    uint32_t wdt = now - pwmRise[i];
+    if (wdt > 800 && wdt < 2200) { pwmVal[i] = (uint16_t)wdt; pwmLast[i] = now; }
+  }
+}
+void IRAM_ATTR isrCh1() { pwmISR(0, RX_CH1); }
+void IRAM_ATTR isrCh2() { pwmISR(1, RX_CH2); }
+void IRAM_ATTR isrCh6() { pwmISR(2, RX_CH6); }
+
+bool rxAlive() {
+#if RX_MODE_PPM
+  return (micros() - ppmLast) < 100000UL;
+#else
+  // Alive if the AUTO-switch channel is still updating. That channel is the
+  // one that matters for safety, so it is the one we watch.
+  return (micros() - pwmLast[2]) < 100000UL;
+#endif
+}
+
+// ch(0)=steering, ch(1)=throttle, ch(4)=the AUTO switch.
+// The indices stay the same in both modes so the rest of the code does not
+// care which wiring you used.
+int ch(int i) {
+#if RX_MODE_PPM
+  uint16_t v = ppm[i];
+  return (v > 800 && v < 2200) ? v : 1500;
+#else
+  if (i == 0) return pwmVal[0];
+  if (i == 1) return pwmVal[1];
+  if (i == 4) return pwmVal[2];
+  return 1500;
+#endif
+}
 
 // ---- motors --------------------------------------------------------------
 void side(int fwd, int rev, int pwm) {
@@ -112,9 +175,18 @@ void setup() {
   ledcSetup(CH_RR, 15000, 8); ledcAttachPin(R_RPWM, CH_RR);
   ledcSetup(CH_RL, 15000, 8); ledcAttachPin(R_LPWM, CH_RL);
 
+#if RX_MODE_PPM
   pinMode(PPM_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(PPM_PIN), ppmISR, RISING);
   memset((void*)ppm, 0, sizeof(ppm));
+  event("RX_PPM");
+#else
+  pinMode(RX_CH1, INPUT); pinMode(RX_CH2, INPUT); pinMode(RX_CH6, INPUT);
+  attachInterrupt(digitalPinToInterrupt(RX_CH1), isrCh1, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(RX_CH2), isrCh2, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(RX_CH6), isrCh6, CHANGE);
+  event("RX_PWM_CH1_CH2_CH6");
+#endif
 
   stopAll();
   event("BOOT");
@@ -134,7 +206,7 @@ void loop() {
 
   if (now - tCtl >= 20) {                       // 50 Hz
     tCtl = now;
-    bool rc = ppmAlive();
+    bool rc = rxAlive();
     bool wantAuto = (rc && ch(4) > 1600);       // CH5 high
 
     if (!wantAuto) {
@@ -177,6 +249,9 @@ void loop() {
     const char* ms = mode == MANUAL    ? "MANUAL"
                    : mode == AUTO_RUN  ? "AUTO_RUN"
                    : mode == AUTO_DONE ? "AUTO_DONE" : "AUTO_IDLE";
-    Serial.printf("#T,%lu,%s,%d\n", now, ms, steerCmd);
+    // The extra fields make wiring problems obvious from the terminal:
+    // if ch1/ch2/ch6 sit at 1500/1500/1500 the receiver is not being read.
+    Serial.printf("#T,%lu,%s,%d,%d,%d,%d\n",
+                  now, ms, steerCmd, ch(0), ch(1), ch(4));
   }
 }

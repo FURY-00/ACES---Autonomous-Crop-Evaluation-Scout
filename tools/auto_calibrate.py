@@ -21,7 +21,9 @@ Two phases
 
 Usage
 -----
-    python3 tools/auto_calibrate.py                    # collect 100, then fit
+    python3 tools/auto_calibrate.py --manual           # tap to shoot
+    python3 tools/auto_calibrate.py                    # timed, every 1.5 s
+    # open  http://<pi-ip>:8080  for the live view and the CAPTURE button
     python3 tools/auto_calibrate.py --count 60
     python3 tools/auto_calibrate.py --interval 1.5
     python3 tools/auto_calibrate.py --fit-only         # re-fit saved frames
@@ -40,6 +42,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 
 import cv2
@@ -52,6 +55,118 @@ from perception import detector as D        # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "config", "detector_tuned.json")
+
+
+
+# ---------------------------------------------------------------- preview
+# Collecting blind is a bad idea: you cannot tell whether the leaf is framed,
+# in focus, or washed out until the session is over and the fit is already
+# poisoned. This serves the live view in a browser so you can see what you
+# are actually feeding it.
+_pv = {"frame": None, "text": "starting", "shoot": 0, "last": ""}
+_pv_lock = threading.Lock()
+PREVIEW_PORT = 8080
+
+try:
+    from flask import Flask, Response
+    _papp = Flask(__name__)
+    HAVE_FLASK = True
+except ImportError:
+    HAVE_FLASK = False
+
+if HAVE_FLASK:
+    @_papp.route("/cam.mjpg")
+    def _pv_cam():
+        def gen():
+            while True:
+                with _pv_lock:
+                    f = _pv["frame"]
+                if f is not None:
+                    ok, buf = cv2.imencode(".jpg", f,
+                                           [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    if ok:
+                        yield (b"--f\r\nContent-Type: image/jpeg\r\n\r\n"
+                               + buf.tobytes() + b"\r\n")
+                time.sleep(0.08)
+        return Response(gen(),
+                        mimetype="multipart/x-mixed-replace; boundary=f")
+
+    @_papp.route("/readout")
+    def _pv_read():
+        with _pv_lock:
+            return _pv["text"]
+
+    @_papp.route("/shoot", methods=["POST"])
+    def _pv_shoot():
+        # The button only RAISES a request. The capture itself happens in the
+        # main loop, which owns the camera -- grabbing a frame from a Flask
+        # thread while the loop is mid-read is a good way to get a torn or
+        # duplicated image.
+        with _pv_lock:
+            _pv["shoot"] += 1
+            return _pv["last"] or "requested"
+
+    @_papp.route("/")
+    def _pv_index():
+        return """<!doctype html><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ACES calibration</title>
+<style>
+:root{--loam:#12160f;--panel:#1b2116;--rule:#2f3a26;--crop:#7fb069;
+      --ink:#e8ece3;--dim:#8b9680;
+      --mono:ui-monospace,"DejaVu Sans Mono",Menlo,monospace}
+*{box-sizing:border-box}
+body{margin:0;background:var(--loam);color:var(--ink);font:13px/1.55 var(--mono)}
+header{padding:11px 15px;border-bottom:1px solid var(--rule);background:var(--panel)}
+h1{margin:0;font-size:12px;letter-spacing:.26em;font-weight:700}
+main{padding:14px}
+img{width:100%;display:block;border:1px solid var(--rule);background:#000}
+pre{margin:14px 0 0;padding:13px 15px;background:var(--panel);
+  border:1px solid var(--rule);white-space:pre-wrap;font-size:12.5px}
+/* big enough to hit one-handed on a phone while holding the Pi */
+#shoot{width:100%;margin-top:14px;padding:22px;font:inherit;font-size:15px;
+  letter-spacing:.22em;font-weight:700;background:var(--crop);color:var(--loam);
+  border:0;border-radius:3px;cursor:pointer;-webkit-tap-highlight-color:transparent}
+#shoot:active{background:#a7d189;transform:scale(.99)}
+#shoot[disabled]{background:var(--rule);color:var(--dim)}
+#flash{margin-top:9px;text-align:center;font-size:11px;letter-spacing:.14em;
+  color:var(--crop);min-height:16px}
+</style>
+<header><h1>ACES &mdash; CALIBRATION CAPTURE</h1></header>
+<main>
+ <img src="/cam.mjpg" alt="Live Pi Camera view during calibration capture">
+ <button id="shoot">CAPTURE</button>
+ <div id="flash"></div>
+ <pre id="r">connecting</pre>
+</main>
+<script>
+const btn=document.getElementById('shoot'), flash=document.getElementById('flash');
+async function shoot(){
+  btn.disabled=true;
+  try{
+    const t=await (await fetch('/shoot',{method:'POST'})).text();
+    flash.textContent=t;
+  }catch(e){ flash.textContent='failed'; }
+  setTimeout(()=>{btn.disabled=false;},350);
+}
+btn.onclick=shoot;
+// space bar works too, for anyone on a laptop
+addEventListener('keydown',e=>{if(e.code==='Space'){e.preventDefault();shoot();}});
+setInterval(async()=>{try{
+ document.getElementById('r').textContent=await(await fetch('/readout')).text();
+}catch(e){}},300);
+</script>"""
+
+    def start_preview():
+        import logging
+        logging.getLogger("werkzeug").setLevel(logging.ERROR)
+        threading.Thread(target=lambda: _papp.run(
+            host="0.0.0.0", port=PREVIEW_PORT, threaded=True,
+            debug=False, use_reloader=False), daemon=True).start()
+        print(f"[preview] http://<pi-ip>:{PREVIEW_PORT}")
+else:
+    def start_preview():
+        print("[preview] flask missing, no browser view. pip install flask")
 
 
 # ---------------------------------------------------------------- collect
@@ -102,34 +217,119 @@ def sharpness(bgr):
     return float(cv2.Laplacian(g, cv2.CV_64F).var())
 
 
-def collect(outdir, count, interval, min_sharp):
+def collect(outdir, count, interval, min_sharp, no_preview=False,
+            manual=False):
+    """
+    Two capture modes.
+
+      manual  you tap CAPTURE in the browser. You get exactly the frames you
+              meant to take, and none you did not. Better handheld, because
+              you are not racing a timer while reframing.
+
+      timer   a frame every `interval` seconds, blurry ones skipped. Better
+              when the bot is driving itself past a row.
+    """
     os.makedirs(outdir, exist_ok=True)
     cam = open_camera()
-    print(f"\nCollecting {count} frames, one every {interval:.1f}s.")
-    print("Carry or drive the bot past plants. Vary the angle, the distance,")
-    print("and include some healthy AND some diseased leaves.")
+    if not no_preview:
+        start_preview()
+    elif manual:
+        print("[warn] --no-preview with --manual leaves no way to trigger a "
+              "shot; falling back to the timer.")
+        manual = False
+
+    print(f"\nCollecting up to {count} frames.")
+    if manual:
+        print("Tap CAPTURE in the browser (or press SPACE) for each shot.")
+    else:
+        print(f"One frame every {interval:.1f}s, blurry frames skipped.")
+    print("Vary distance, angle, rotation and background.")
+    print("Include BOTH healthy and diseased leaves.")
     print("Ctrl-C to stop early and fit what you have.\n")
 
     kept = rejected = 0
+    last_grab = 0.0
+    seen_shots = 0
+    saved_at = 0.0
+
     try:
         while kept < count:
             f = grab(cam)
             if f is None:
-                time.sleep(0.2)
+                time.sleep(0.1)
                 continue
             sh = sharpness(f)
-            if sh < min_sharp:
-                rejected += 1
-                print(f"  [{kept:3d}/{count}] skipped, blurry ({sh:.0f})",
-                      end="\r")
-                time.sleep(0.4)
-                continue
-            path = os.path.join(outdir, f"cal_{kept:04d}.jpg")
-            cv2.imwrite(path, f, [cv2.IMWRITE_JPEG_QUALITY, 92])
-            kept += 1
-            print(f"  [{kept:3d}/{count}] saved  sharpness {sh:6.0f}   "
-                  f"({rejected} blurry skipped)", end="\r")
-            time.sleep(interval)
+
+            # ---- decide whether to save this frame --------------------
+            want = False
+            forced = False
+            if manual:
+                with _pv_lock:
+                    pending = _pv["shoot"]
+                if pending > seen_shots:
+                    seen_shots = pending
+                    want = True
+                    forced = True          # you asked for it; you get it
+            else:
+                want = (time.time() - last_grab) >= interval
+
+            saved = False
+            if want:
+                if sh < min_sharp and not forced:
+                    rejected += 1
+                else:
+                    path = os.path.join(outdir, f"cal_{kept:04d}.jpg")
+                    cv2.imwrite(path, f, [cv2.IMWRITE_JPEG_QUALITY, 92])
+                    kept += 1
+                    saved = True
+                    saved_at = time.time()
+                    msg = f"saved {kept}/{count}  sharpness {sh:.0f}"
+                    if sh < min_sharp:
+                        msg += "  (soft, but you asked)"
+                    with _pv_lock:
+                        _pv["last"] = msg
+                    print(f"  {msg}")
+                last_grab = time.time()
+
+            # ---- live preview -------------------------------------------
+            if not no_preview:
+                small = cv2.resize(f, (640, 360))
+                hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+                V = hsv[:, :, 2]
+                blown = float((V > 250).mean())
+                dark = float((V < 12).mean())
+                b, g, r = cv2.split(small.astype(np.float32))
+                d = (g - r) / (r + g + b + 1e-6)
+                green_frac = float((d > 0.05).mean())
+
+                ok_sharp = sh >= min_sharp
+                col = (0, 220, 0) if ok_sharp else (0, 140, 255)
+                cv2.rectangle(small, (0, 0), (640, 26), (0, 0, 0), -1)
+                cv2.putText(small,
+                            f"{kept}/{count}   sharp {sh:5.0f}"
+                            f"   {'OK' if ok_sharp else 'BLURRY'}",
+                            (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1)
+                # green border lingers briefly so you see it on a phone
+                if time.time() - saved_at < 0.6:
+                    cv2.rectangle(small, (0, 0), (639, 359), (0, 255, 0), 5)
+                with _pv_lock:
+                    _pv["frame"] = small
+                    _pv["text"] = (
+                        f"mode       {'MANUAL - tap CAPTURE' if manual else 'TIMER'}\n"
+                        f"kept       {kept}/{count}      "
+                        f"skipped (blurry) {rejected}\n"
+                        f"sharpness  {sh:6.0f}   "
+                        f"{'OK' if ok_sharp else 'TOO BLURRY - hold steadier'}\n"
+                        f"green      {green_frac:.1%} of frame   "
+                        f"{'' if green_frac > 0.05 else '<-- no leaf in view?'}\n"
+                        f"blown out  {blown:.1%}   "
+                        f"{'<-- too bright, move to shade' if blown > 0.08 else ''}\n"
+                        f"very dark  {dark:.1%}   "
+                        f"{'<-- too dark' if dark > 0.15 else ''}\n"
+                        f"\n"
+                        f"vary distance, angle, rotation and background\n"
+                        f"include BOTH healthy and diseased leaves")
+            time.sleep(0.05)
     except KeyboardInterrupt:
         print("\n  stopped early")
     finally:
@@ -137,7 +337,7 @@ def collect(outdir, count, interval, min_sharp):
             cam[1].stop()
         else:
             cam[1].release()
-    print(f"\n\n{kept} frames -> {outdir}")
+    print(f"\n{kept} frames -> {outdir}")
     return outdir
 
 
@@ -270,6 +470,10 @@ def main():
     ap.add_argument("--dir", default=None)
     ap.add_argument("--fit-only", action="store_true")
     ap.add_argument("--write", action="store_true")
+    ap.add_argument("--no-preview", action="store_true",
+                    help="skip the browser preview")
+    ap.add_argument("--manual", action="store_true",
+                    help="capture only when you tap CAPTURE in the browser")
     ap.add_argument("--set", action="append", default=[],
                     metavar="KEY=VALUE",
                     help="override a fitted value, e.g. --set d_abs_max=0.085")
@@ -279,7 +483,8 @@ def main():
         ROOT, "dataset", "autocal_" + time.strftime("%m%d_%H%M"))
 
     if not a.fit_only:
-        folder = collect(folder, a.count, a.interval, a.min_sharp)
+        folder = collect(folder, a.count, a.interval, a.min_sharp,
+                         a.no_preview, a.manual)
     elif a.dir is None:
         cands = sorted(d for d in os.listdir(os.path.join(ROOT, "dataset"))
                        if d.startswith("autocal_")) \

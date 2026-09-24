@@ -103,6 +103,12 @@ class Telegram:
             f"Confidence: {record.get('confidence',0):.0%}\n"
             f"Time: {time.strftime('%H:%M:%S')}"
         )
+        # An uncertain detection still goes out, clearly labelled. Sending a
+        # doubtful photo costs a glance; withholding a real one costs a crop.
+        if not record.get("trusted", True):
+            note = record.get("note", "")
+            caption += ("\n\n\u26A0\uFE0F <i>UNVERIFIED</i>"
+                        + (f" - {note}" if note else ""))
         if lat and lon:
             caption += (f"\nLocation: {lat:.6f}, {lon:.6f}"
                         f"\nhttps://maps.google.com/?q={lat},{lon}")
